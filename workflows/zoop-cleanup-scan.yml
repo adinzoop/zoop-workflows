@@ -1,0 +1,276 @@
+name: Zoop Cleanup Scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  cleanup-scan:
+    name: Dead Code + Unused Deps
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Detect repo language(s) ─────────────────────────────────────────────
+      - name: Detect languages
+        id: langs
+        run: |
+          has_go=false; has_js=false; has_py=false
+          [ -f go.mod ] && has_go=true
+          [ -f package.json ] && has_js=true
+          ls *.py scripts/*.py 2>/dev/null && has_py=true || true
+          find . -name "*.py" -not -path "./.git/*" | head -1 | grep -q . && has_py=true || true
+          echo "go=$has_go" >> $GITHUB_OUTPUT
+          echo "js=$has_js" >> $GITHUB_OUTPUT
+          echo "py=$has_py" >> $GITHUB_OUTPUT
+          echo "Languages: go=$has_go js=$has_js py=$has_py"
+
+      # ── Get changed files ───────────────────────────────────────────────────
+      - name: Get changed files
+        run: |
+          git diff --name-only origin/${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          head -c 12000 /tmp/pr.diff > /tmp/pr_scan.diff
+          echo "Changed files:"
+          cat /tmp/changed_files.txt
+
+      # ── Go: deadcode ────────────────────────────────────────────────────────
+      - name: Go dead code (deadcode)
+        if: steps.langs.outputs.go == 'true'
+        run: |
+          go install golang.org/x/tools/cmd/deadcode@latest 2>/dev/null || true
+          if command -v deadcode &>/dev/null; then
+            deadcode ./... 2>/dev/null | head -50 > /tmp/deadcode_go.txt || true
+          else
+            echo "" > /tmp/deadcode_go.txt
+          fi
+        continue-on-error: true
+
+      # ── Go: unused deps (go mod tidy diff) ─────────────────────────────────
+      - name: Go unused deps
+        if: steps.langs.outputs.go == 'true'
+        run: |
+          cp go.mod /tmp/go.mod.orig 2>/dev/null || true
+          cp go.sum /tmp/go.sum.orig 2>/dev/null || true
+          go mod tidy 2>/dev/null || true
+          diff /tmp/go.mod.orig go.mod > /tmp/gomod_diff.txt 2>/dev/null || echo "" > /tmp/gomod_diff.txt
+          # Restore
+          cp /tmp/go.mod.orig go.mod 2>/dev/null || true
+          cp /tmp/go.sum.orig go.sum 2>/dev/null || true
+        continue-on-error: true
+
+      # ── Python: vulture (dead code) ─────────────────────────────────────────
+      - name: Set up Python
+        if: steps.langs.outputs.py == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python dead code (vulture)
+        if: steps.langs.outputs.py == 'true'
+        run: |
+          pip install vulture --quiet
+          vulture . --min-confidence 80 2>/dev/null | head -50 > /tmp/vulture.txt || echo "" > /tmp/vulture.txt
+        continue-on-error: true
+
+      # ── JS/TS: knip (dead code + unused deps) ──────────────────────────────
+      - name: Set up Node
+        if: steps.langs.outputs.js == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: JS/TS dead code + unused deps (knip)
+        if: steps.langs.outputs.js == 'true'
+        run: |
+          npm install --global knip 2>/dev/null || true
+          if command -v knip &>/dev/null; then
+            knip --reporter json > /tmp/knip.json 2>/dev/null || echo '{}' > /tmp/knip.json
+          else
+            echo '{}' > /tmp/knip.json
+          fi
+        continue-on-error: true
+
+      # ── GLM synthesis ───────────────────────────────────────────────────────
+      - name: GLM Cleanup Analysis
+        id: glm
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          diff = open('/tmp/pr_scan.diff').read().strip()
+
+          # Gather scanner results
+          scanner_lines = []
+
+          for path, label in [('/tmp/deadcode_go.txt','Go/deadcode'), ('/tmp/vulture.txt','Python/vulture'), ('/tmp/gomod_diff.txt','Go/go-mod-tidy')]:
+              try:
+                  content = open(path).read().strip()
+                  if content:
+                      for line in content.splitlines()[:20]:
+                          scanner_lines.append(f"[{label}] {line}")
+              except FileNotFoundError:
+                  pass
+
+          try:
+              knip = json.load(open('/tmp/knip.json'))
+              for f in knip.get('files', [])[:10]:
+                  scanner_lines.append(f"[JS/knip] Unused file: {f}")
+              for dep in knip.get('unlisted', [])[:10]:
+                  scanner_lines.append(f"[JS/knip] Unlisted dependency: {dep}")
+              for dep in knip.get('unresolved', [])[:10]:
+                  scanner_lines.append(f"[JS/knip] Unresolved import: {dep}")
+              exports = knip.get('exports', {})
+              for file, syms in list(exports.items())[:10]:
+                  for sym in syms[:5]:
+                      scanner_lines.append(f"[JS/knip] Unused export: {sym} in {file}")
+          except Exception:
+              pass
+
+          scanner_text = "\n".join(scanner_lines) if scanner_lines else "No automated scanner flagged anything."
+
+          if not diff and not scanner_lines:
+              with open('/tmp/cleanup_findings.json', 'w') as f:
+                  json.dump([], f)
+              with open('/tmp/cleanup_verdict.txt', 'w') as f:
+                  f.write('pass')
+              print("No diff and no scanner findings — clean")
+              sys.exit(0)
+
+          system = (
+              "You are a senior engineer doing a cleanup code review.\n"
+              "You receive: (A) a git diff of a PR, and (B) output from dead-code and unused-dependency scanners.\n"
+              "Find code that is unnecessarily added — dead code, unused variables, unused imports, unused dependencies, duplicate logic, unreachable routes.\n"
+              "For each issue write a plain-English explanation of why it's unnecessary and how to remove it.\n"
+              "Return a JSON object with key 'findings' containing an array. Each item must have:\n"
+              '{"title": string, "severity": "high"|"medium"|"low"|"info", '
+              '"category": "dead-code"|"unused-dep"|"unused-import"|"duplicate-logic"|"dead-endpoint"|"other", '
+              '"description": string, "file_path": string|null, "line": number|null, '
+              '"exploitable": false, '
+              '"remediation": string, "evidence": string|null, "source": "knip"|"vulture"|"deadcode"|"go-mod"|"glm"}\n'
+              "Only flag things introduced in this diff. Skip false positives.\n"
+              'Return {"findings":[]} if the PR adds no unnecessary code.\n'
+              "Respond with valid JSON only — no markdown, no code fences."
+          )
+
+          user_content = f"Scanner output:\n{scanner_text}\n\nGit diff:\n{diff[:8000]}"
+
+          payload = json.dumps({
+              "model": "z-ai/glm-5.3-flash",
+              "messages": [
+                  {"role": "system", "content": system},
+                  {"role": "user", "content": user_content}
+              ],
+              "temperature": 0.1
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                  "Content-Type": "application/json",
+                  "HTTP-Referer": "https://github.com/adinzoop",
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  data = json.loads(resp.read())
+          except urllib.error.HTTPError as e:
+              print(f"GLM error: {e.code} {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+
+          text = data['choices'][0]['message']['content'].strip()
+          if text.startswith('```'):
+              lines = text.split('\n')
+              text = '\n'.join(lines[1:])
+              text = text.rstrip('`').strip()
+
+          result = json.loads(text)
+          findings = result.get('findings', [])
+
+          verdict = 'pass' if not findings else ('neutral' if all(f.get('severity') in ('low','info') for f in findings) else 'neutral')
+
+          with open('/tmp/cleanup_findings.json', 'w') as f:
+              json.dump(findings, f)
+          with open('/tmp/cleanup_verdict.txt', 'w') as f:
+              f.write(verdict)
+
+          print(f"Verdict: {verdict} | Cleanup findings: {len(findings)}")
+          PYEOF
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      # ── Post PR comment ─────────────────────────────────────────────────────
+      - name: Post Cleanup Scan Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const findings = JSON.parse(fs.readFileSync('/tmp/cleanup_findings.json', 'utf8'));
+
+            const CAT = {
+              'dead-code':       '💀 Dead code',
+              'unused-dep':      '📦 Unused dependency',
+              'unused-import':   '📥 Unused import',
+              'duplicate-logic': '🔁 Duplicate logic',
+              'dead-endpoint':   '🛑 Dead endpoint',
+              'other':           '🔍 Other'
+            };
+            const SOURCE = {
+              knip:     '`knip`',
+              vulture:  '`vulture`',
+              deadcode: '`deadcode`',
+              'go-mod': '`go mod tidy`',
+              glm:      '`GLM 5.3`'
+            };
+
+            let body = '';
+            if (findings.length === 0) {
+              body = '## ✅ Cleanup Scan — Clean\n\nNo dead code or unused dependencies found in this PR.';
+            } else {
+              body = `## 🧹 Cleanup Scan — ${findings.length} item${findings.length !== 1 ? 's' : ''} to clean up\n\n`;
+              body += `> Report-only — this doesn't block the merge. Cleaning these up keeps the codebase lean.\n\n`;
+
+              for (const f of findings) {
+                body += `### ${CAT[f.category] || f.category} — ${f.title}\n`;
+                body += `**Scanner:** ${SOURCE[f.source] || f.source}`;
+                if (f.file_path) body += ` · **File:** \`${f.file_path}\`${f.line ? ` · line ${f.line}` : ''}`;
+                body += '\n\n';
+                body += `${f.description}\n\n`;
+                if (f.evidence) body += `\`\`\`\n${f.evidence}\n\`\`\`\n\n`;
+                body += `**Fix:** ${f.remediation}\n\n---\n\n`;
+              }
+              body += `*Powered by knip · vulture · deadcode · go mod tidy · GLM 5.3-flash*`;
+            }
+
+            // Delete old Cleanup Scan comments
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            for (const c of comments) {
+              if (c.body.includes('Cleanup Scan')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });

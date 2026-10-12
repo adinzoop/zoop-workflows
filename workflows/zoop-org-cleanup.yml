@@ -1,0 +1,247 @@
+name: Zoop Org Cleanup
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # Every Monday 9am UTC
+  workflow_dispatch:        # Manual trigger for testing
+
+jobs:
+  org-cleanup:
+    name: Stale PRs + Branches + Repos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Scan stale PRs ──────────────────────────────────────────────────────
+      - name: Scan stale PRs + branches + repos
+        id: scan
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys, urllib.request, urllib.error, datetime
+
+          token = os.environ['GITHUB_TOKEN']
+          repo  = os.environ['GITHUB_REPOSITORY']
+          owner, repo_name = repo.split('/', 1)
+
+          now = datetime.datetime.utcnow()
+          STALE_PR_DAYS     = 30
+          STALE_BRANCH_DAYS = 60
+          STALE_REPO_DAYS   = 180
+
+          def gh_get(path, params=''):
+              url = f"https://api.github.com/{path}?per_page=100{params}"
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def days_since(iso_str):
+              if not iso_str:
+                  return 0
+              dt = datetime.datetime.strptime(iso_str[:19], "%Y-%m-%dT%H:%M:%S")
+              return (now - dt).days
+
+          report = {"stale_prs": [], "stale_branches": [], "stale_repos": []}
+
+          # Stale PRs in this repo
+          try:
+              prs = gh_get(f"repos/{owner}/{repo_name}/pulls", "&state=open")
+              for pr in prs:
+                  age = days_since(pr.get('updated_at'))
+                  if age >= STALE_PR_DAYS:
+                      report['stale_prs'].append({
+                          "number": pr['number'],
+                          "title": pr['title'],
+                          "author": pr['user']['login'],
+                          "days_stale": age,
+                          "url": pr['html_url'],
+                      })
+          except Exception as e:
+              print(f"PR scan error: {e}")
+
+          # Stale branches
+          try:
+              branches = gh_get(f"repos/{owner}/{repo_name}/branches")
+              for b in branches:
+                  if b['name'] in ('main', 'master', 'develop', 'dev'):
+                      continue
+                  try:
+                      commit = gh_get(f"repos/{owner}/{repo_name}/commits/{b['commit']['sha']}")
+                      age = days_since(commit.get('commit', {}).get('committer', {}).get('date'))
+                      if age >= STALE_BRANCH_DAYS:
+                          report['stale_branches'].append({
+                              "name": b['name'],
+                              "days_stale": age,
+                              "last_commit": commit.get('commit', {}).get('committer', {}).get('date', 'unknown')[:10],
+                          })
+                  except Exception:
+                      pass
+          except Exception as e:
+              print(f"Branch scan error: {e}")
+
+          # Org-level stale repos (if this is run in an org context)
+          org = owner
+          try:
+              repos = gh_get(f"orgs/{org}/repos", "&type=all&sort=pushed")
+              for r in repos:
+                  if r.get('archived'):
+                      continue
+                  age = days_since(r.get('pushed_at'))
+                  if age >= STALE_REPO_DAYS:
+                      report['stale_repos'].append({
+                          "name": r['name'],
+                          "full_name": r['full_name'],
+                          "days_stale": age,
+                          "last_push": r.get('pushed_at', 'unknown')[:10],
+                          "url": r['html_url'],
+                      })
+          except Exception:
+              # Not an org or no access — skip repo scan
+              pass
+
+          with open('/tmp/cleanup_report.json', 'w') as f:
+              json.dump(report, f, indent=2)
+
+          total = len(report['stale_prs']) + len(report['stale_branches']) + len(report['stale_repos'])
+          print(f"Found: {len(report['stale_prs'])} stale PRs, {len(report['stale_branches'])} stale branches, {len(report['stale_repos'])} stale repos")
+          print(f"Total items: {total}")
+          PYEOF
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Post GitHub Issue with weekly report ────────────────────────────────
+      - name: Post weekly cleanup issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs  = require('fs');
+            const report = JSON.parse(fs.readFileSync('/tmp/cleanup_report.json', 'utf8'));
+
+            const total = report.stale_prs.length + report.stale_branches.length + report.stale_repos.length;
+            const today = new Date().toISOString().slice(0, 10);
+
+            if (total === 0) {
+              console.log('Nothing stale — skipping issue creation');
+              return;
+            }
+
+            let body = `# 🧹 Weekly Org Cleanup Report — ${today}\n\n`;
+            body += `Automated scan found **${total} items** that may need attention.\n`;
+            body += `> Report-only — nothing is deleted automatically.\n\n`;
+
+            if (report.stale_prs.length > 0) {
+              body += `## 🕰️ Stale PRs (open > 30 days)\n\n`;
+              body += `| PR | Title | Author | Days Open | Link |\n`;
+              body += `|---|---|---|---|---|\n`;
+              for (const pr of report.stale_prs) {
+                body += `| #${pr.number} | ${pr.title.slice(0, 60)} | @${pr.author} | ${pr.days_stale}d | [Open](${pr.url}) |\n`;
+              }
+              body += '\n**Action:** Review each PR. Close if no longer needed, or add a comment explaining the delay.\n\n';
+            }
+
+            if (report.stale_branches.length > 0) {
+              body += `## 🌿 Stale Branches (no activity > 60 days)\n\n`;
+              body += `| Branch | Last Commit | Days Stale |\n`;
+              body += `|---|---|---|\n`;
+              for (const b of report.stale_branches) {
+                body += `| \`${b.name}\` | ${b.last_commit} | ${b.days_stale}d |\n`;
+              }
+              body += '\n**Action:** Delete merged branches. For unmerged ones — decide if the work is still needed.\n\n';
+            }
+
+            if (report.stale_repos.length > 0) {
+              body += `## 📦 Stale Repos (no push > 6 months)\n\n`;
+              body += `| Repo | Last Push | Days Stale | Link |\n`;
+              body += `|---|---|---|---|\n`;
+              for (const r of report.stale_repos) {
+                body += `| \`${r.name}\` | ${r.last_push} | ${r.days_stale}d | [Open](${r.url}) |\n`;
+              }
+              body += '\n**Action:** Archive repos that are no longer maintained. Delete only if confirmed unused.\n\n';
+            }
+
+            body += `---\n*Generated by Zoop Org Cleanup · runs every Monday 9am UTC*`;
+
+            // Check if a cleanup issue already exists this week
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['cleanup-report']
+            });
+
+            const existingThisWeek = issues.find(i => i.title.includes(today));
+
+            if (existingThisWeek) {
+              // Update existing issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingThisWeek.number,
+                body
+              });
+              console.log(`Updated existing issue #${existingThisWeek.number}`);
+            } else {
+              // Create new issue
+              const label = await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'cleanup-report',
+                color: 'e4e669',
+                description: 'Weekly automated cleanup report'
+              }).catch(() => null);
+
+              const { data: issue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🧹 Weekly Cleanup Report — ${today}`,
+                body,
+                labels: ['cleanup-report']
+              });
+              console.log(`Created issue #${issue.number}: ${issue.html_url}`);
+            }
+
+      # ── Post to Slack (optional — only if token is set) ────────────────────
+      - name: Slack alert
+        if: env.SLACK_BOT_TOKEN != ''
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request
+
+          report = json.load(open('/tmp/cleanup_report.json'))
+          total  = sum(len(v) for v in report.values())
+          token  = os.environ['SLACK_BOT_TOKEN']
+          channel = os.environ.get('SLACK_CHANNEL', '#dev-ops')
+
+          if total == 0:
+              print("Nothing to report — skipping Slack")
+              exit(0)
+
+          text = (
+              f"🧹 *Weekly Org Cleanup Report*\n"
+              f"*{len(report['stale_prs'])}* stale PRs · "
+              f"*{len(report['stale_branches'])}* stale branches · "
+              f"*{len(report['stale_repos'])}* stale repos\n"
+              f"Check the GitHub issue for the full breakdown."
+          )
+
+          payload = json.dumps({"channel": channel, "text": text}).encode()
+          req = urllib.request.Request(
+              "https://slack.com/api/chat.postMessage",
+              data=payload,
+              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+          )
+          with urllib.request.urlopen(req) as r:
+              print(r.read().decode())
+          PYEOF
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL:   ${{ secrets.SLACK_CLEANUP_CHANNEL }}

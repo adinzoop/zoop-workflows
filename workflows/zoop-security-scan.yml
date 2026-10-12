@@ -1,0 +1,296 @@
+name: Zoop Security Scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  security-scan:
+    name: SAST + Secrets + IaC
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 1. Get PR diff ──────────────────────────────────────────────────────
+      - name: Get PR diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          head -c 15000 /tmp/pr.diff > /tmp/pr_scan.diff
+          echo "Diff size: $(wc -c < /tmp/pr.diff) bytes"
+
+      # ── 2. Gitleaks — secrets in code + git history ─────────────────────────
+      - name: Install Gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz | tar -xz -C /usr/local/bin gitleaks
+          chmod +x /usr/local/bin/gitleaks
+
+      - name: Run Gitleaks
+        id: gitleaks
+        run: |
+          # Scan staged diff first
+          gitleaks detect --source . --log-opts "origin/${{ github.base_ref }}...HEAD" \
+            --report-format json --report-path /tmp/gitleaks.json --no-banner || true
+
+          if [ -f /tmp/gitleaks.json ] && [ -s /tmp/gitleaks.json ]; then
+            echo "Gitleaks found secrets"
+          else
+            echo '[]' > /tmp/gitleaks.json
+          fi
+
+      # ── 3. Semgrep — SAST ───────────────────────────────────────────────────
+      - name: Set up Python for Semgrep
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Semgrep
+        run: pip install semgrep --quiet
+
+      - name: Run Semgrep
+        id: semgrep
+        run: |
+          # Run on changed files only for speed
+          git diff --name-only origin/${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+          cat /tmp/changed_files.txt
+
+          # Run semgrep on the repo (use free rules)
+          semgrep scan \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --json \
+            --output /tmp/semgrep.json \
+            --no-rewrite-rule-ids \
+            --quiet \
+            . || true
+
+          if [ ! -f /tmp/semgrep.json ]; then
+            echo '{"results":[]}' > /tmp/semgrep.json
+          fi
+          echo "Semgrep findings: $(python3 -c "import json; d=json.load(open('/tmp/semgrep.json')); print(len(d.get('results',[])))")"
+
+      # ── 4. Checkov — IaC misconfigurations ─────────────────────────────────
+      - name: Install Checkov
+        run: pip install checkov --quiet
+
+      - name: Run Checkov
+        id: checkov
+        run: |
+          checkov \
+            --directory . \
+            --output json \
+            --soft-fail \
+            --quiet \
+            > /tmp/checkov.json 2>/dev/null || true
+
+          if [ ! -f /tmp/checkov.json ] || [ ! -s /tmp/checkov.json ]; then
+            echo '{"results":{"failed_checks":[]}}' > /tmp/checkov.json
+          fi
+          echo "Checkov done"
+
+      # ── 5. GLM synthesis — reads all scanner output, writes remediation ─────
+      - name: GLM Security Analysis
+        id: glm
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys, urllib.request, urllib.error
+
+          diff = open('/tmp/pr_scan.diff').read().strip()
+
+          # Load scanner results
+          try:
+              gitleaks = json.load(open('/tmp/gitleaks.json'))
+              if not isinstance(gitleaks, list):
+                  gitleaks = []
+          except Exception:
+              gitleaks = []
+
+          try:
+              semgrep_data = json.load(open('/tmp/semgrep.json'))
+              semgrep = semgrep_data.get('results', [])
+          except Exception:
+              semgrep = []
+
+          try:
+              checkov_data = json.load(open('/tmp/checkov.json'))
+              if isinstance(checkov_data, list):
+                  checkov_failed = []
+                  for item in checkov_data:
+                      r = item.get('results', {})
+                      checkov_failed.extend(r.get('failed_checks', []))
+              else:
+                  checkov_failed = checkov_data.get('results', {}).get('failed_checks', [])
+          except Exception:
+              checkov_failed = []
+
+          # Summarize scanner findings for GLM
+          scanner_summary = []
+          for s in gitleaks[:10]:
+              scanner_summary.append(f"[SECRETS/Gitleaks] {s.get('Description','secret')} in {s.get('File','unknown')} line {s.get('StartLine','?')}")
+          for s in semgrep[:15]:
+              scanner_summary.append(f"[SAST/Semgrep] {s.get('check_id','rule')} — {s.get('path','?')}:{s.get('start',{}).get('line','?')} — {s.get('extra',{}).get('message','')[:120]}")
+          for c in checkov_failed[:10]:
+              scanner_summary.append(f"[IaC/Checkov] {c.get('check_id','')} {c.get('check_type','')} FAILED — {c.get('resource','?')} in {c.get('repo_file_path','?')}")
+
+          scanner_text = "\n".join(scanner_summary) if scanner_summary else "No automated scanner flagged anything."
+
+          if not diff and not scanner_summary:
+              print("No diff and no scanner findings — clean pass")
+              with open('/tmp/security_findings.json', 'w') as f:
+                  json.dump([], f)
+              with open('/tmp/security_verdict.txt', 'w') as f:
+                  f.write('pass')
+              sys.exit(0)
+
+          system = (
+              "You are a senior application-security engineer.\n"
+              "You receive: (A) a git diff of a PR, and (B) automated scanner output from Semgrep, Gitleaks, and Checkov.\n"
+              "Synthesize both into a final findings list. For each real issue write a clear, actionable remediation.\n"
+              "Return a JSON object with key 'findings' containing an array. Each item must have exactly:\n"
+              '{"title": string, "severity": "critical"|"high"|"medium"|"low"|"info", '
+              '"check": "sast"|"secrets"|"iac"|"api-security", '
+              '"description": string, "file_path": string|null, "line": number|null, '
+              '"owasp_tag": string|null, "exploitable": boolean, '
+              '"remediation": string, "evidence": string|null, "source": "semgrep"|"gitleaks"|"checkov"|"glm"}\n'
+              "Deduplicate — if Semgrep and your own analysis agree, emit one finding with source=semgrep.\n"
+              "Only flag lines added in the diff (lines starting with +). Skip false positives.\n"
+              'Return {"findings":[]} if everything is clean.\n'
+              "Respond with valid JSON only — no markdown, no code fences."
+          )
+
+          user_content = f"Scanner output:\n{scanner_text}\n\nGit diff:\n{diff[:8000]}"
+
+          payload = json.dumps({
+              "model": "z-ai/glm-5.3-flash",
+              "messages": [
+                  {"role": "system", "content": system},
+                  {"role": "user", "content": user_content}
+              ],
+              "temperature": 0.1
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                  "Content-Type": "application/json",
+                  "HTTP-Referer": "https://github.com/adinzoop",
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  data = json.loads(resp.read())
+          except urllib.error.HTTPError as e:
+              print(f"GLM API error: {e.code} {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+
+          text = data['choices'][0]['message']['content'].strip()
+          if text.startswith('```'):
+              lines = text.split('\n')
+              text = '\n'.join(lines[1:])
+              text = text.rstrip('`').strip()
+
+          result = json.loads(text)
+          findings = result.get('findings', [])
+
+          # Derive verdict
+          verdict = 'pass'
+          for f in findings:
+              sev = f.get('severity', '')
+              if sev in ('critical', 'high') or f.get('exploitable'):
+                  verdict = 'fail'
+                  break
+              elif sev in ('medium', 'low', 'info'):
+                  verdict = 'neutral'
+
+          with open('/tmp/security_findings.json', 'w') as f:
+              json.dump(findings, f)
+          with open('/tmp/security_verdict.txt', 'w') as f:
+              f.write(verdict)
+
+          print(f"Verdict: {verdict} | Findings: {len(findings)}")
+          print(f"  Secrets: {len(gitleaks)} | SAST: {len(semgrep)} | IaC: {len(checkov_failed)}")
+          PYEOF
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      # ── 6. Post PR comment ─────────────────────────────────────────────────
+      - name: Post Security Scan Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const findings = JSON.parse(fs.readFileSync('/tmp/security_findings.json', 'utf8'));
+            const verdict  = fs.readFileSync('/tmp/security_verdict.txt', 'utf8').trim();
+
+            const SEV = {
+              critical: '🔴 CRITICAL',
+              high:     '🟠 HIGH',
+              medium:   '🟡 MEDIUM',
+              low:      '🔵 LOW',
+              info:     '⚪ INFO'
+            };
+            const SOURCE = {
+              semgrep:  '`Semgrep`',
+              gitleaks: '`Gitleaks`',
+              checkov:  '`Checkov`',
+              glm:      '`GLM 5.3`'
+            };
+
+            let body = '';
+            if (verdict === 'pass' || findings.length === 0) {
+              body = '## ✅ Security Scan — Clean\n\n**Semgrep · Gitleaks · Checkov · GLM 5.3** found no issues in this PR.';
+            } else {
+              const icon = verdict === 'fail' ? '❌' : '⚠️';
+              const counts = {critical:0, high:0, medium:0, low:0, info:0};
+              findings.forEach(f => { if (counts[f.severity] !== undefined) counts[f.severity]++; });
+              const summary = Object.entries(counts).filter(([,v]) => v > 0)
+                .map(([k,v]) => `${SEV[k]}: ${v}`).join(' · ');
+
+              body = `## ${icon} Security Scan — ${findings.length} finding${findings.length !== 1 ? 's' : ''}\n`;
+              body += `${summary}\n\n`;
+              body += `> **Report-only — merge is not blocked.** Tag @adin to discuss critical findings.\n\n`;
+
+              for (const f of findings) {
+                body += `### ${SEV[f.severity] || f.severity.toUpperCase()} — ${f.title}\n`;
+                body += `**Scanner:** ${SOURCE[f.source] || f.source} · **Check:** \`${f.check}\``;
+                if (f.owasp_tag) body += ` · **OWASP:** ${f.owasp_tag}`;
+                body += '\n';
+                if (f.file_path) body += `**File:** \`${f.file_path}\`${f.line ? ` · line ${f.line}` : ''}\n`;
+                body += `\n${f.description}\n\n`;
+                if (f.evidence) body += `\`\`\`\n${f.evidence}\n\`\`\`\n\n`;
+                body += `**Fix:** ${f.remediation}\n\n---\n\n`;
+              }
+              body += `*Powered by Semgrep · Gitleaks · Checkov · GLM 5.3-flash*`;
+            }
+
+            // Delete old Security Scan comments
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            for (const c of comments) {
+              if (c.body.includes('Security Scan')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
