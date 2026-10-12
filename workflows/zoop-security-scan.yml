@@ -34,8 +34,12 @@ jobs:
       - name: Run Gitleaks
         id: gitleaks
         run: |
-          # Scan staged diff first
+          # Use .gitleaks.toml allowlist if present, otherwise use defaults
+          CONFIG_FLAG=""
+          [ -f .gitleaks.toml ] && CONFIG_FLAG="--config .gitleaks.toml"
+
           gitleaks detect --source . --log-opts "origin/${{ github.base_ref }}...HEAD" \
+            $CONFIG_FLAG \
             --report-format json --report-path /tmp/gitleaks.json --no-banner || true
 
           if [ -f /tmp/gitleaks.json ] && [ -s /tmp/gitleaks.json ]; then

@@ -1,0 +1,73 @@
+[allowlist]
+description = "Zoop global allowlist — skip known false positives"
+
+# Skip entire files
+paths = [
+    ".gitleaks.toml",
+    ".*_test\\.go$",
+    ".*\\.test\\.(ts|js)$",
+    ".*__tests__.*",
+    ".*fixtures.*",
+    ".*testdata.*",
+    ".*/mock.*",
+    ".*/fake.*",
+]
+
+# Skip lines containing these patterns
+regexes = [
+    # Local/dev URLs — not real secrets
+    "localhost",
+    "127\\.0\\.0\\.1",
+    "0\\.0\\.0\\.0",
+    "example\\.com",
+    "test\\.com",
+    "placeholder",
+    "your[_-]?api[_-]?key",
+    "your[_-]?secret",
+    "change[_-]?me",
+    "replace[_-]?me",
+    "TODO",
+    "FIXME",
+    "CHANGEME",
+
+    # Obvious dummy/example values
+    "xxxx+",
+    "1234567890",
+    "abcdefgh",
+    "aaaaaaa",
+    "test[_-]?key",
+    "dev[_-]?key",
+    "fake[_-]?key",
+    "dummy",
+    "sample",
+
+    # Already in env — not hardcoded
+    "os\\.environ",
+    "os\\.getenv",
+    "process\\.env",
+    "secrets\\.",
+    "\\$\\{.*\\}",
+    "\\$[A-Z_]+",
+]
+
+# Stop-words — if the value is one of these exact strings, skip it
+stopwords = [
+    "localhost",
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "changeme",
+    "placeholder",
+    "your-api-key",
+    "your-secret-key",
+    "example",
+    "test",
+    "dummy",
+    "null",
+    "none",
+    "undefined",
+    "true",
+    "false",
+]
