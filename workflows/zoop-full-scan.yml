@@ -1,0 +1,340 @@
+name: Zoop Full Codebase Scan
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'   # Every Sunday 2am UTC
+  workflow_dispatch:        # Manual trigger for testing
+
+jobs:
+  full-scan:
+    name: Full Repo — SAST + Secrets + Dead Code
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout full repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full git history for Gitleaks
+
+      # ── 1. Gitleaks — full repo + entire git history ───────────────────────
+      - name: Install Gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz | tar -xz -C /usr/local/bin gitleaks
+          chmod +x /usr/local/bin/gitleaks
+
+      - name: Gitleaks — full repo scan
+        run: |
+          CONFIG_FLAG=""
+          [ -f .gitleaks.toml ] && CONFIG_FLAG="--config .gitleaks.toml"
+
+          # Scan entire repo including full git history
+          gitleaks detect --source . $CONFIG_FLAG \
+            --report-format json --report-path /tmp/gitleaks_full.json --no-banner || true
+
+          if [ ! -f /tmp/gitleaks_full.json ] || [ ! -s /tmp/gitleaks_full.json ]; then
+            echo '[]' > /tmp/gitleaks_full.json
+          fi
+
+          echo "Gitleaks findings: $(python3 -c "import json; d=json.load(open('/tmp/gitleaks_full.json')); print(len(d) if isinstance(d, list) else 0)")"
+        continue-on-error: true
+
+      # ── 2. Semgrep — full repo SAST ────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Semgrep
+        run: pip install semgrep --quiet
+
+      - name: Semgrep — full repo scan
+        run: |
+          semgrep scan \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --config "p/security-audit" \
+            --json \
+            --output /tmp/semgrep_full.json \
+            --no-rewrite-rule-ids \
+            --quiet \
+            . || true
+
+          if [ ! -f /tmp/semgrep_full.json ]; then
+            echo '{"results":[]}' > /tmp/semgrep_full.json
+          fi
+
+          echo "Semgrep findings: $(python3 -c "import json; d=json.load(open('/tmp/semgrep_full.json')); print(len(d.get('results',[])))")"
+        continue-on-error: true
+
+      # ── 3. Checkov — full IaC scan ─────────────────────────────────────────
+      - name: Install Checkov
+        run: pip install checkov --quiet
+
+      - name: Checkov — full repo scan
+        run: |
+          checkov --directory . --output json --soft-fail --quiet > /tmp/checkov_full.json 2>/dev/null || true
+          if [ ! -f /tmp/checkov_full.json ] || [ ! -s /tmp/checkov_full.json ]; then
+            echo '{"results":{"failed_checks":[]}}' > /tmp/checkov_full.json
+          fi
+          echo "Checkov done"
+        continue-on-error: true
+
+      # ── 4. Dead code — full repo ───────────────────────────────────────────
+      - name: Detect languages
+        id: langs
+        run: |
+          has_go=false; has_js=false; has_py=false
+          [ -f go.mod ] && has_go=true
+          [ -f package.json ] && has_js=true
+          find . -name "*.py" -not -path "./.git/*" | head -1 | grep -q . && has_py=true || true
+          echo "go=$has_go" >> $GITHUB_OUTPUT
+          echo "js=$has_js" >> $GITHUB_OUTPUT
+          echo "py=$has_py" >> $GITHUB_OUTPUT
+
+      - name: Set up Node
+        if: steps.langs.outputs.js == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Dead code — Python (vulture)
+        if: steps.langs.outputs.py == 'true'
+        run: |
+          pip install vulture --quiet
+          python3 -m vulture . --min-confidence 70 2>/dev/null | head -100 > /tmp/vulture_full.txt || echo "" > /tmp/vulture_full.txt
+        continue-on-error: true
+
+      - name: Dead code — JS/TS (knip)
+        if: steps.langs.outputs.js == 'true'
+        run: |
+          npm install --global knip 2>/dev/null || true
+          knip --reporter json > /tmp/knip_full.json 2>/dev/null || echo '{}' > /tmp/knip_full.json
+        continue-on-error: true
+
+      - name: Dead code — Go (deadcode)
+        if: steps.langs.outputs.go == 'true'
+        run: |
+          go install golang.org/x/tools/cmd/deadcode@latest 2>/dev/null || true
+          deadcode ./... 2>/dev/null | head -100 > /tmp/deadcode_full.txt || echo "" > /tmp/deadcode_full.txt
+        continue-on-error: true
+
+      # ── 5. GLM synthesis — full scan summary ──────────────────────────────
+      - name: GLM Full Scan Analysis
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys, urllib.request, urllib.error, re
+
+          # Load all scanner results
+          try:
+              gitleaks = json.load(open('/tmp/gitleaks_full.json'))
+              if not isinstance(gitleaks, list): gitleaks = []
+          except Exception:
+              gitleaks = []
+
+          try:
+              semgrep = json.load(open('/tmp/semgrep_full.json')).get('results', [])
+          except Exception:
+              semgrep = []
+
+          try:
+              ck = json.load(open('/tmp/checkov_full.json'))
+              if isinstance(ck, list):
+                  checkov = []
+                  for item in ck:
+                      checkov.extend(item.get('results', {}).get('failed_checks', []))
+              else:
+                  checkov = ck.get('results', {}).get('failed_checks', [])
+          except Exception:
+              checkov = []
+
+          dead_code = []
+          for path, label in [('/tmp/vulture_full.txt','Python/vulture'), ('/tmp/deadcode_full.txt','Go/deadcode')]:
+              try:
+                  content = open(path).read().strip()
+                  if content:
+                      for line in content.splitlines()[:30]:
+                          dead_code.append(f"[{label}] {line}")
+              except FileNotFoundError:
+                  pass
+
+          try:
+              knip = json.load(open('/tmp/knip_full.json'))
+              for f in knip.get('files', [])[:15]:
+                  dead_code.append(f"[JS/knip] Unused file: {f}")
+              for dep in knip.get('unlisted', [])[:15]:
+                  dead_code.append(f"[JS/knip] Unlisted dep: {dep}")
+          except Exception:
+              pass
+
+          # Build summary for GLM
+          lines = []
+          for s in gitleaks[:15]:
+              lines.append(f"[SECRETS/Gitleaks] {s.get('Description','secret')} in {s.get('File','?')} line {s.get('StartLine','?')}")
+          for s in semgrep[:20]:
+              lines.append(f"[SAST/Semgrep] {s.get('check_id','')} — {s.get('path','?')}:{s.get('start',{}).get('line','?')} — {s.get('extra',{}).get('message','')[:100]}")
+          for c in checkov[:10]:
+              lines.append(f"[IaC/Checkov] {c.get('check_id','')} FAILED — {c.get('resource','?')} in {c.get('repo_file_path','?')}")
+          lines.extend(dead_code[:20])
+
+          scanner_text = "\n".join(lines) if lines else "No issues found."
+          total = len(gitleaks) + len(semgrep) + len(checkov) + len(dead_code)
+
+          print(f"Total raw findings: {total}")
+          print(f"  Secrets: {len(gitleaks)} | SAST: {len(semgrep)} | IaC: {len(checkov)} | Dead code: {len(dead_code)}")
+
+          if total == 0:
+              with open('/tmp/full_scan_findings.json', 'w') as f:
+                  json.dump([], f)
+              print("Clean codebase — no findings")
+              sys.exit(0)
+
+          system = (
+              "You are a senior application-security engineer doing a full codebase audit.\n"
+              "You receive automated scanner output from Gitleaks, Semgrep, Checkov, and dead-code tools.\n"
+              "Synthesize into a prioritised findings list. Write plain-English explanations and exact fixes.\n"
+              "Return JSON with key 'findings'. Each item: title, severity (critical/high/medium/low/info), "
+              "check (sast/secrets/iac/dead-code/api-security), description, file_path (string or null), "
+              "line (number or null), owasp_tag (string or null), exploitable (bool), remediation, "
+              "evidence (string or null), source (semgrep/gitleaks/checkov/vulture/knip/deadcode/glm).\n"
+              "Deduplicate. Prioritise by exploitability and severity.\n"
+              "Return {\"findings\":[]} if everything is clean.\n"
+              "Respond with valid JSON only — no markdown, no code fences."
+          )
+
+          payload = json.dumps({
+              "model": "z-ai/glm-5.3-flash",
+              "messages": [
+                  {"role": "system", "content": system},
+                  {"role": "user", "content": f"Full codebase scanner output:\n{scanner_text}"}
+              ],
+              "temperature": 0.1
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                  "Content-Type": "application/json",
+                  "HTTP-Referer": "https://github.com/adinzoop",
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  data = json.loads(resp.read())
+          except urllib.error.HTTPError as e:
+              print(f"GLM error: {e.code} {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+
+          text = data['choices'][0]['message']['content'].strip()
+          text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
+          text = re.sub(r'\n?```$', '', text).strip()
+
+          try:
+              result = json.loads(text)
+          except json.JSONDecodeError:
+              match = re.search(r'\{[\s\S]*\}', text)
+              result = json.loads(match.group(0)) if match else {"findings": []}
+
+          findings = result.get('findings', [])
+
+          with open('/tmp/full_scan_findings.json', 'w') as f:
+              json.dump(findings, f)
+
+          print(f"GLM synthesised: {len(findings)} findings")
+          PYEOF
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      # ── 6. Create GitHub Issue with full report ────────────────────────────
+      - name: Create weekly scan issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs   = require('fs');
+            const findings = JSON.parse(fs.readFileSync('/tmp/full_scan_findings.json', 'utf8'));
+            const today = new Date().toISOString().slice(0, 10);
+
+            const SEV = {
+              critical: '🔴 CRITICAL',
+              high:     '🟠 HIGH',
+              medium:   '🟡 MEDIUM',
+              low:      '🔵 LOW',
+              info:     '⚪ INFO'
+            };
+            const CHECK = {
+              'sast':      '🛡️ SAST',
+              'secrets':   '🔑 Secrets',
+              'iac':       '⚙️ IaC',
+              'dead-code': '💀 Dead code',
+              'api-security': '🌐 API',
+            };
+
+            let body = `# 🔍 Weekly Full Codebase Scan — ${today}\n\n`;
+
+            if (findings.length === 0) {
+              body += `✅ **No issues found.** The full codebase scan came back clean.\n\n`;
+            } else {
+              const counts = {critical:0, high:0, medium:0, low:0, info:0};
+              findings.forEach(f => { if (counts[f.severity] !== undefined) counts[f.severity]++; });
+              const summary = Object.entries(counts).filter(([,v]) => v > 0)
+                .map(([k,v]) => `${SEV[k]}: ${v}`).join(' · ');
+
+              body += `**${findings.length} findings across the full codebase**\n`;
+              body += `${summary}\n\n`;
+              body += `> This is a full codebase scan — not limited to a PR diff. Report-only, nothing is blocked.\n\n`;
+              body += `---\n\n`;
+
+              for (const f of findings) {
+                body += `### ${SEV[f.severity] || f.severity.toUpperCase()} — ${f.title}\n`;
+                body += `**Type:** ${CHECK[f.check] || f.check}`;
+                if (f.owasp_tag) body += ` · **OWASP:** ${f.owasp_tag}`;
+                body += ` · **Source:** \`${f.source}\`\n`;
+                if (f.file_path) body += `**File:** \`${f.file_path}\`${f.line ? ` · line ${f.line}` : ''}\n`;
+                body += `\n${f.description}\n\n`;
+                if (f.evidence) body += `\`\`\`\n${f.evidence}\n\`\`\`\n\n`;
+                body += `**Fix:** ${f.remediation}\n\n---\n\n`;
+              }
+            }
+
+            body += `*Powered by Gitleaks · Semgrep · Checkov · vulture · knip · GLM 5.3-flash*\n`;
+            body += `*Runs every Sunday 2am UTC — full repo, not just PR diffs*`;
+
+            // Create label if it doesn't exist
+            await github.rest.issues.createLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'full-scan',
+              color: 'd93f0b',
+              description: 'Weekly full codebase security scan'
+            }).catch(() => null);
+
+            // Close previous open full-scan issues to avoid clutter
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['full-scan']
+            });
+            for (const i of open) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: i.number,
+                state: 'closed'
+              });
+            }
+
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔍 Full Codebase Scan — ${today}`,
+              body,
+              labels: ['full-scan']
+            });
+
+            console.log(`Created issue #${issue.number}: ${issue.html_url}`);
